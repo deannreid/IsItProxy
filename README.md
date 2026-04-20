@@ -1,39 +1,145 @@
 # IsItProxy
 
-Domain routing analyser for pentest engagements. Runs from the local machine, uses an SSH SOCKS proxy to see domains from the jumpbox's perspective, then tells Burp Suite exactly how to route each one.
+Domain routing analyser for pentest engagements.
 
-Built for engagements where the tester VPNs into an internal Kali jumpbox that has no direct internet - only a corporate proxy - but where some traffic (Microsoft/Entra SSO, corporate CDNs) must go Direct to Internet via a PAC file the jumpbox can't use.
+Runs from your local machine and uses an SSH SOCKS tunnel to observe applications from the **jumpbox perspective**, then tells you exactly how traffic must be routed in tools like Burp Suite.
+
+Built for environments where:
+
+* You pivot through a jumpbox (VPN / SSH)
+* The jumpbox has **no direct internet access**
+* External access requires a **corporate proxy**
+* Some traffic (e.g. Microsoft / Entra SSO, CDNs) must go **Direct Internet (DIA)**
+
+---
+
+## What problem this solves
+
+Corporate routing is rarely simple:
+
+```text
+Internal App → Direct (VPN)
+             → Proxy (corp proxy)
+             → Direct Internet (DIA via PAC)
+```
+
+If you get routing wrong:
+
+* Requests silently fail
+* SSO breaks
+* Burp becomes unreliable
+* You waste time troubleshooting networking instead of testing
+
+**IsItProxy identifies the correct path up front.**
 
 ---
 
 ## How it works
 
-1. **SOCKS setup** - connects through `ssh -D 1080 user@jumpbox` to fetch pages from the jumpbox's perspective, not the tester's local machine
-2. **PAC file parsing** - load a PAC file (local path or URL) to automatically identify which domains are `DIRECT` (DIA) vs `PROXY`; no need to know your PAC contents in advance
-3. **Nameserver lookup** - queries NS records for the root domain to identify who controls DNS
-4. **Dual DNS resolution** - resolves every domain via local DNS and via `8.8.8.8`; a private local IP or local-only resolution flags it as internal (different public IPs are anycast/geo-DNS, not split-horizon)
-5. **Deep crawl** - follows every domain referenced in the page including linked JS and CSS files:
-   - HTML attributes (`href`, `src`, `action`, `data-*`)
-   - Inline `<script>` and `<style>` blocks
-   - External JS files - fetched and scanned for `fetch()`, `axios`, `XMLHttpRequest`, string URLs
-   - External CSS files - fetched and scanned for `url()`, `@import`
-   - Response headers (`Content-Security-Policy`, `Link`, `Location`, `Refresh`)
-   - HTTP redirect chains
-6. **Burp Suite config** - writes a ready-to-import JSON file that routes internal domains via SOCKS and lets everything else go direct from the tester's machine
+1. **SOCKS tunnel (jumpbox view)**
+   Uses `ssh -D` to see the target from the jumpbox’s network perspective.
+
+2. **Proxy testing (critical)**
+   Determines if a domain is reachable:
+
+   * directly (via SOCKS / VPN)
+   * or only via **corporate proxy**
+
+3. **PAC file parsing (optional but powerful)**
+   Extracts:
+
+   * `DIRECT` → DIA domains
+   * `PROXY` → proxy-routed domains
+
+4. **DNS analysis**
+
+   * Local resolution (jumpbox view)
+   * Public resolution (`8.8.8.8`)
+   * Detects:
+
+     * private/internal IPs
+     * split-horizon DNS
+     * anycast (not misclassified as internal)
+
+5. **Deep crawling**
+   Extracts domains from:
+
+   * HTML (`href`, `src`, `action`, `data-*`)
+   * JavaScript (inline + external: `fetch`, `axios`, XHR)
+   * CSS (`url()`, `@import`)
+   * headers (`CSP`, `Location`, `Link`)
+   * redirect chains
+
+6. **SSO / Identity chain discovery**
+   Automatically surfaces authentication flows, commonly involving:
+
+   * Microsoft / Microsoft Entra ID
+     (`login.microsoftonline.com`, `aadcdn.*`, `msftauth.*`)
+   * Other IdPs (Okta, Auth0, Ping, etc.)
+
+   SSO often follows a **different routing path than the app itself**.
+
+7. **Burp Suite config generation**
+   Writes a ready-to-import config:
+
+   * Internal → SOCKS
+   * Proxy-only → handled via routing logic
+   * DIA / External → direct from your machine
 
 ---
 
 ## Classification
 
-| Label | Colour | Meaning |
-|---|---|---|
-| `DIA / HOST NET` | Yellow/Red | Known DIA domain - Burp routes direct from tester's machine |
-| `SOCKS BLOCKED` | Magenta | Public IP, jumpbox couldn't reach it - likely unlisted DIA or missing proxy config |
-| `INTERNAL` | Green | Private IP or local-only DNS - Burp routes via SOCKS tunnel |
-| `EXTERNAL` | Cyan | Public IP reachable via SOCKS - Burp routes direct from tester's machine |
-| `UNRESOLVABLE` | Dim | No DNS from either perspective |
+| Label              | Colour     | Meaning                                                     |
+| ------------------ | ---------- | ----------------------------------------------------------- |
+| `INTERNAL`         | Green      | Reachable directly via jumpbox (no proxy)                   |
+| `INTERNAL (PROXY)` | Blue       | Only reachable via corporate proxy                          |
+| `DIA / HOST NET`   | Yellow/Red | Must bypass jumpbox and go direct from your machine         |
+| `SOCKS BLOCKED`    | Magenta    | Jumpbox cannot reach - likely proxy required or missing PAC |
+| `EXTERNAL`         | Cyan       | Public and reachable without special routing                |
+| `UNRESOLVABLE`     | Dim        | No DNS and no connectivity                                  |
 
-`SOCKS BLOCKED` means the jumpbox couldn't connect but it has a consistent public IP. Without a PAC file loaded the tool can't tell if this is DIA or a proxy gap - load your PAC with `--pac-file` or `--pac-url` to resolve the ambiguity automatically.
+---
+
+## Key behaviour (important)
+
+### DNS is NOT authoritative
+
+This tool does **not** assume:
+
+```text
+No DNS = dead domain
+```
+
+Instead:
+
+```text
+No DNS + Proxy works = PROXY-ONLY DOMAIN
+```
+
+---
+
+## Example output
+
+```text
+portal.internal.local         [INTERNAL]
+├── assets.cdnprovider.net    [INTERNAL (PROXY)]
+├── static.cdnprovider.net    [INTERNAL (PROXY)]
+└── auth.internal.local       [INTERNAL]
+    ├── login.microsoftonline.com  [DIA / HOST NET]
+    ├── aadcdn.msauth.net          [DIA / HOST NET]
+    ├── aadcdn.msftauth.net        [DIA / HOST NET]
+    ├── msftauth.net               [DIA / HOST NET]
+    └── graph.microsoft.com        [DIA / HOST NET]
+```
+
+### Why this matters
+
+* App traffic → VPN
+* CDN traffic → proxy
+* SSO traffic → DIA
+
+If routed incorrectly, authentication and application behaviour will break.
 
 ---
 
@@ -43,117 +149,204 @@ Built for engagements where the tester VPNs into an internal Kali jumpbox that h
 pip install -r requirements.txt
 ```
 
-Python 3.11+ required.
+Python 3.11+
 
-Before running, open a separate terminal and create the SSH SOCKS proxy:
+Start your SOCKS tunnel:
 
 ```bash
-ssh -D 1080 -N -q user@jumpbox-ip
+ssh -D 1080 -N -q user@jumpbox
 ```
 
 ---
 
 ## Usage
 
-### Interactive
+### Interactive (recommended)
 
 ```bash
 python IsItProxy.py
 ```
 
-Walks through SOCKS proxy setup, optional PAC file loading, and target entry. Recommended for first use.
+Prompts for:
+
+* SOCKS proxy
+* PAC file (optional)
+* Corporate proxy (important)
+* Target URL
+
+---
 
 ### Non-interactive
 
 ```bash
-# SOCKS + local PAC file
-python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \
-    --pac-file /path/to/proxy.pac
-
-# SOCKS + fetch PAC from internal WPAD server through the tunnel
-python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \
-    --pac-url http://wpad.corp.local/proxy.pac
-
-# PAC + extra domains not in the PAC
-python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \
-    --pac-file proxy.pac --dia-domain okta.com --dia-domain auth0.com
-
-# No SOCKS (local DNS only, results are from tester's perspective)
-python IsItProxy.py --url https://portal.corp.local --no-socks
-
-# DNS and NS lookup only, no HTTP crawl
-python IsItProxy.py --url portal.corp.local --no-socks --depth 0
-
-# Deeper crawl
-python IsItProxy.py --url https://portal.corp.local --socks-port 1080 --depth 3 --timeout 15
-
-# PAC-only DIA list, skip built-in Microsoft domains
-python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \
-    --pac-file proxy.pac --no-builtin-dia
+python IsItProxy.py \
+    --url https://portal.corp.local \
+    --socks-port 1080 \
+    --pac-file proxy.pac
 ```
 
-### Options
+---
 
-| Flag | Default | Description |
-|---|---|---|
-| `--url` | interactive | Target URL or bare hostname |
-| `--socks-port PORT` | interactive | SOCKS5 proxy port on `127.0.0.1` |
-| `--no-socks` | off | Skip SOCKS, use local DNS only |
-| `--pac-file FILE` | - | Local PAC file to parse for DIA domains |
-| `--pac-url URL` | - | URL of PAC file to fetch (goes via SOCKS if set) |
-| `--no-builtin-dia` | off | Exclude built-in Microsoft DIA list; use PAC/custom only |
-| `--dia-domain DOMAIN` | - | Additional DIA apex domain, repeatable |
-| `--dia-file FILE` | - | Text file of DIA apex domains, one per line (`#` = comment) |
-| `--depth N` | `2` | Crawl depth - `0` = DNS + NS only, no HTTP |
-| `--timeout SEC` | `10` | Per-request HTTP timeout in seconds |
+### Examples
+
+```bash
+# SOCKS + PAC
+python IsItProxy.py --url https://portal --socks-port 1080 --pac-file proxy.pac
+
+# Fetch PAC via tunnel
+python IsItProxy.py --url https://portal --socks-port 1080 \
+    --pac-url http://wpad.corp.local/proxy.pac
+
+# Add custom DIA domains
+python IsItProxy.py --url https://portal --socks-port 1080 \
+    --dia-domain okta.com
+
+# No SOCKS (local testing)
+python IsItProxy.py --url https://portal --no-socks
+
+# DNS only
+python IsItProxy.py --url portal.local --depth 0
+```
 
 ---
 
-## PAC file support
+## Options
 
-PAC files are JavaScript. The parser extracts `shExpMatch`, `dnsDomainIs`, and `host ==` conditions and maps each to its `return "DIRECT"` or `return "PROXY ..."` outcome using brace-depth tracking. Flat and nested if/else chains are both handled.
-
-PAC files with runtime logic (e.g. IP-range conditionals that affect which domains go DIRECT) may not be fully parsed - the tool reports how many conditions it couldn't classify. Any remaining `SOCKS BLOCKED` domains after loading a PAC are worth reviewing manually.
+| Flag               | Description                |
+| ------------------ | -------------------------- |
+| `--url`            | Target URL or hostname     |
+| `--socks-port`     | SOCKS5 port                |
+| `--no-socks`       | Disable SOCKS              |
+| `--pac-file`       | Local PAC file             |
+| `--pac-url`        | Fetch PAC via HTTP         |
+| `--dia-domain`     | Add DIA domain             |
+| `--dia-file`       | File of DIA domains        |
+| `--depth`          | Crawl depth                |
+| `--timeout`        | HTTP timeout               |
+| `--no-builtin-dia` | Disable Microsoft defaults |
 
 ---
 
-## Burp Suite config
+## Burp Suite integration
 
-After each run the script writes **`IsItProxy_burp_<host>_<timestamp>.json`** automatically.
+Generates:
 
-### Routing strategy
+```text
+IsItProxy_burp_<target>_<timestamp>.json
+```
 
-| Domain type | What Burp does |
-|---|---|
-| `INTERNAL` | Upstream SOCKS5 rule → `127.0.0.1:<socks_port>` - routes via SSH tunnel to jumpbox |
-| `DIA / HOST NET` | No rule - Burp connects directly from the tester's machine |
-| `EXTERNAL` | No rule - Burp connects directly from the tester's machine |
+### Routing
 
-No proxy is needed on the jumpbox. Internal traffic flows via the SOCKS tunnel; everything else goes direct from the tester's machine without touching the jumpbox at all.
+| Type             | Behaviour                |
+| ---------------- | ------------------------ |
+| INTERNAL         | Routed via SOCKS         |
+| INTERNAL (PROXY) | Routed via SOCKS + proxy |
+| DIA              | Direct from your machine |
+| EXTERNAL         | Direct from your machine |
 
-> **Do not enable a global SOCKS proxy in Burp.** The upstream rules handle internal routing. A global SOCKS would push DIA and external traffic through the jumpbox, breaking those requests.
+---
 
-### Importing
+### Import
 
-**Burp Suite 2023+**
-Gear icon → Project → **Load project options file** → select the `.json` file
+**Burp 2023+**
 
-**Burp Suite 2022 and earlier**
-Project options → Misc → Save/restore → **Restore project options** → select the `.json` file
+```
+Settings → Project → Load project options file
+```
+
+**Older versions**
+
+```
+Project options → Misc → Restore
+```
+
+---
+
+### Important
+
+Do NOT enable a global SOCKS proxy in Burp.
+
+This breaks:
+
+* DIA traffic
+* external access
+
+---
+
+## PAC support
+
+Parses:
+
+* `shExpMatch`
+* `dnsDomainIs`
+* `host ==`
+
+Handles:
+
+* nested conditions
+* if/else chains
+
+Limitations:
+
+* runtime logic may not fully resolve
+* unmatched rules are reported
 
 ---
 
 ## Built-in DIA domains
 
-The following apex domains (and all subdomains) are flagged as DIA by default. Extend via `--dia-domain`, `--dia-file`, or `--pac-file`.
+Includes common Microsoft / Microsoft Entra ID / Azure domains by default.
 
-`microsoft.com` · `microsoftonline.com` · `live.com` · `outlook.com` · `office.com` · `office365.com` · `sharepoint.com` · `onmicrosoft.com` · `azure.com` · `azureedge.net` · `azurewebsites.net` · `windows.net` · `windowsazure.com` · `sts.windows.net` · `msauth.net` · `msftauth.net` · `msidentity.com` · `graph.microsoft.com` · `teams.microsoft.com` · `skype.com` · `visualstudio.com` · `trafficmanager.net` · `1drv.com` · `lync.com` · `msocsp.com` · `msocdn.com` · `msappproxy.net`
+Extend via:
+
+```bash
+--dia-domain
+--dia-file
+--pac-file
+```
 
 ---
 
 ## Limitations
 
-- JavaScript-rendered content (SPAs that build URLs at runtime via `eval` or string concatenation) cannot be fully discovered statically
-- Pages behind SSO redirect to a login domain - this is still useful, as it surfaces the Microsoft/IdP domains involved
-- Higher crawl depths increase request count and runtime significantly; start at the default of `2`
-- The SOCKS proxy must already be running before the script starts
+* No full JavaScript execution (dynamic SPAs may hide endpoints)
+* Proxy authentication (NTLM/Kerberos) not fully supported yet
+* Proxy success ≠ full app access (login pages may still appear)
+* Deep crawling increases runtime
+
+---
+
+## TODO
+
+* [ ] PAC auto-discovery (WPAD)
+* [ ] Proxy authentication support
+* [ ] IdP detection (Okta / Entra / Ping)
+* [ ] Smarter Burp routing rules
+
+---
+
+## TL;DR
+
+This tool answers:
+
+> “How must this domain be routed to actually work?”
+
+Not:
+
+> “Does DNS resolve?”
+
+---
+
+## Why this matters
+
+Without this:
+
+* Proxy-only domains look “dead”
+* SSO breaks unpredictably
+* Burp routing becomes guesswork
+
+With this:
+
+* Routing is correct first time
+* Burp works reliably
+* You focus on testing, not networking

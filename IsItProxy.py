@@ -109,6 +109,7 @@ class Routing(Enum):
     DIA_REQUIRED  = auto()  # known DIA domain → must use host network, not VPN
     SOCKS_BLOCKED = auto()  # public IP, SOCKS unreachable → possible unlisted DIA
     INTERNAL      = auto()  # private IP or split-horizon DNS → use VPN/jumpbox
+    INTERNAL_PROXY= auto()  # private IP but also reachable via SOCKS → use VPN, but proxy on jumpbox if needed
     EXTERNAL      = auto()  # public IP reachable via SOCKS → needs corp proxy on jumpbox or host
     UNRESOLVABLE  = auto()  # no DNS from either perspective
 
@@ -116,6 +117,7 @@ _ROUTING_META: dict[Routing, tuple[str, str, str, str]] = {
     Routing.DIA_REQUIRED:  ("bold yellow", "bold red",  "DIA / HOST NET",  "Route via host network - NOT through VPN"),
     Routing.SOCKS_BLOCKED: ("bold magenta","magenta",   "SOCKS BLOCKED",   "Jumpbox cannot reach - possible unlisted DIA"),
     Routing.INTERNAL:      ("bold green",  "green",     "INTERNAL",        "Accessible via jumpbox VPN"),
+    Routing.INTERNAL_PROXY: ("bold blue",  "blue",      "INTERNAL PROXY",   "Accessible via jumpbox VPN with proxy"),
     Routing.EXTERNAL:      ("bold cyan",   "cyan",      "EXTERNAL",        "Needs corporate proxy on jumpbox or host"),
     Routing.UNRESOLVABLE:  ("dim white",   "dim",       "UNRESOLVABLE",    "No DNS from either perspective"),
 }
@@ -141,7 +143,9 @@ class DomainResult:
     is_dia:      bool           = False
     dia_reason:  str            = ""
     via_socks:   Optional[bool] = None
+    via_proxy:   Optional[bool] = None
     fetch_error: Optional[str]  = None
+    proxy_error: Optional[str]  = None
     children:    dict           = field(default_factory=dict)
 
 
@@ -395,18 +399,18 @@ def ip_is_private(ip: str) -> bool:
         return False
 
 
-def classify(dns: DNSInfo, is_dia: bool, via_socks: Optional[bool]) -> Routing:
+def classify(dns: DNSInfo, is_dia: bool, via_socks: Optional[bool], via_proxy: Optional[bool]) -> Routing:
     if is_dia:
         return Routing.DIA_REQUIRED
-    # Private local IP or resolves locally but not in public DNS → internal
+    if via_socks:
+        return Routing.INTERNAL
+    if via_proxy:
+        return Routing.INTERNAL_PROXY
     if dns.is_private or dns.split_horizon:
         return Routing.INTERNAL
-    if not dns.local_ip and not dns.external_ip:
+    if not dns.local_ip and not dns.external_ip and not via_proxy:
         return Routing.UNRESOLVABLE
-    # ip_mismatch (different public IPs) falls through to EXTERNAL - it's just anycast
-    if via_socks is False:
-        return Routing.SOCKS_BLOCKED
-    return Routing.EXTERNAL
+    return Routing.SOCKS_BLOCKED
 
 
 ############################# Content extraction #############################
@@ -537,6 +541,16 @@ def extract_domains(
     domains.discard("")
     return domains
 
+######## Proxy session helper #############################
+def _make_proxy_session(proxy_url: str) -> requests.Session:
+    s = requests.Session()
+    s.headers["User-Agent"] = _UA
+    s.proxies = {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+    s.trust_env = False
+    return s
 
 ############################# Core analyser ###############################
 
@@ -549,6 +563,7 @@ def analyse(
     timeout:       int,
     dia_set:       dict[str, str],
     fetch_ns:      bool = False,
+    proxy_url:     Optional[str] = None,
 ) -> DomainResult:
 
     visited.add(hostname)
@@ -559,18 +574,8 @@ def analyse(
     ns          = get_nameservers(hostname) if fetch_ns else []
     priv = ip_is_private(local_ip) if local_ip else False
 
-    # True split-horizon: local gives a private IP, OR local resolves but public DNS doesn't.
-    # Different public IPs between resolvers is just anycast/geo-DNS - NOT internal routing.
-    split = bool(
-        (local_ip and priv) or
-        (local_ip and not external_ip)
-    )
-    # Informational: both resolve but to different public IPs (CDN anycast)
-    mismatch = bool(
-        local_ip and external_ip and
-        local_ip != external_ip and
-        not priv and not ip_is_private(external_ip)
-    )
+    split = bool((local_ip and priv) or (local_ip and not external_ip))
+    mismatch = bool(local_ip and external_ip and local_ip != external_ip and not priv)
 
     dns_info = DNSInfo(
         local_ip=local_ip,
@@ -583,55 +588,59 @@ def analyse(
 
     result = DomainResult(
         hostname=hostname,
-        routing=classify(dns_info, is_dia, None),
+        routing=Routing.UNRESOLVABLE,
         dns=dns_info,
         is_dia=is_dia,
         dia_reason=dia_reason,
     )
 
-    if is_dia or depth >= max_depth or result.routing == Routing.UNRESOLVABLE:
+    if is_dia or depth >= max_depth:
         return result
 
-    session        = socks_session or requests.Session()
-    fetched_resp: Optional[requests.Response] = None
+    session = socks_session or requests.Session()
+    fetched_resp = None
 
-    for scheme in ("https", "http"):
-        url = f"{scheme}://{hostname}"
-        try:
-            resp = session.get(url, timeout=timeout, allow_redirects=True, verify=False)
-            result.via_socks = True if socks_session else None
-            fetched_resp = resp
-            break
-        except requests.exceptions.SSLError:
-            if scheme == "https":
-                continue
-            result.fetch_error = "SSL error"
-        except requests.exceptions.ConnectionError:
-            if socks_session:
-                result.via_socks = False
-            result.fetch_error = "Connection refused"
-            break
-        except requests.exceptions.Timeout:
-            if socks_session:
-                result.via_socks = False
-            result.fetch_error = f"Timed out ({timeout}s)"
-            break
-        except Exception as exc:
+    url = f"https://{hostname}"
+
+    # --- SOCKS TEST
+    try:
+        resp = session.get(url, timeout=timeout, verify=False)
+        result.via_socks = True if socks_session else None
+        fetched_resp = resp
+    except Exception as exc:
+        if socks_session:
+            result.via_socks = False
             result.fetch_error = str(exc)[:80]
-            break
 
-    result.routing = classify(dns_info, is_dia, result.via_socks)
+    # --- PROXY TEST (CRITICAL)
+    if proxy_url:
+        try:
+            proxy_session = _make_proxy_session(proxy_url)
+            proxy_session.get(url, timeout=timeout, verify=False)
+            result.via_proxy = True
+        except Exception as exc:
+            result.via_proxy = False
+            result.proxy_error = str(exc)[:80]
 
-    if fetched_resp is not None:
+    # --- CLASSIFY
+    result.routing = classify(dns_info, is_dia, result.via_socks, result.via_proxy)
+
+    # --- CHILD ENUM
+    if fetched_resp:
         for child in extract_domains(fetched_resp, session, timeout):
             if child and child != hostname and child not in visited:
                 result.children[child] = analyse(
-                    child, depth + 1, max_depth, visited,
-                    socks_session, timeout, dia_set,
+                    child,
+                    depth + 1,
+                    max_depth,
+                    visited,
+                    socks_session,
+                    timeout,
+                    dia_set,
+                    proxy_url=proxy_url,
                 )
 
     return result
-
 
 ############################# Rendering #################################
 
@@ -870,7 +879,7 @@ def print_results(
 
 ############################# Interactive setup #############################
 
-def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], str, Optional[PacResult]]:
+def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], str, Optional[PacResult], Optional[str]]:
     """
     Returns (socks_port, target_url, pac_result_or_None).
     socks_port_hint is pre-filled from --socks-port if given.
@@ -923,20 +932,34 @@ def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], st
     else:
         console.print("[yellow]Running without SOCKS proxy. DNS reflects your machine's resolvers.[/yellow]")
 
-    # PAC file
+        # PAC file
+        console.print()
+        pac_result: Optional[PacResult] = None
+        has_pac = Confirm.ask(
+            "[cyan]Do you have access to a PAC file? (local path or URL)[/cyan]",
+            default=False,
+        )
+        if has_pac:
+            pac_source = Prompt.ask("[cyan]PAC file path or URL[/cyan]").strip()
+            pac_result = _try_load_pac(pac_source, socks_port)
+
     console.print()
-    pac_result: Optional[PacResult] = None
-    has_pac = Confirm.ask(
-        "[cyan]Do you have access to a PAC file? (local path or URL)[/cyan]",
-        default=False,
+    proxy_url = None
+
+    has_proxy = Confirm.ask(
+        "[cyan]Does the environment require a corporate proxy for external access?[/cyan]",
+        default=True,
     )
-    if has_pac:
-        pac_source = Prompt.ask("[cyan]PAC file path or URL[/cyan]").strip()
-        pac_result = _try_load_pac(pac_source, socks_port)
+
+    if has_proxy:
+        proxy_url = Prompt.ask(
+            "[cyan]Proxy URL (e.g. http://proxy.corp.local:8080)[/cyan]"
+        )
 
     console.print()
     target = Prompt.ask("[cyan]Target URL or hostname[/cyan]").strip()
-    return socks_port, target, pac_result
+
+    return socks_port, target, pac_result, proxy_url
 
 
 def _try_load_pac(source: str, socks_port: Optional[int]) -> Optional[PacResult]:
@@ -1144,7 +1167,7 @@ Examples:
         if pac_source:
             pac_result = _try_load_pac(pac_source, socks_port)
     else:
-        socks_port, target, pac_result = interactive_setup(
+        socks_port, target, pac_result, proxy_url = interactive_setup(
             socks_port_hint=args.socks_port if not args.no_socks else None,
         )
         # CLI --url overrides the interactive prompt
@@ -1182,9 +1205,15 @@ Examples:
     visited: set[str] = set()
     with console.status(f"[bold blue]Crawling {hostname}…[/bold blue]", spinner="dots"):
         root = analyse(
-            hostname, 0, args.depth, visited,
+            hostname,
+            0,
+            args.depth,
+            visited,
             session if socks_port else None,
-            args.timeout, dia_set, fetch_ns=True,
+            args.timeout,
+            dia_set,
+            fetch_ns=True,
+            proxy_url=proxy_url,
         )
 
     print_results(root, target, socks_port, dia_set, pac_result)
