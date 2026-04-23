@@ -7,6 +7,7 @@ see domains from the jumpbox's perspective.
 Author : https://github.com/deannreid
 """
 
+import getpass
 import ipaddress
 import json
 import re
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import dns.resolver
@@ -33,6 +34,12 @@ from rich.text import Text
 from rich.tree import Tree
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:
+    from requests_ntlm import HttpNtlmAuth as _NtlmAuth
+    _HAS_NTLM = True
+except ImportError:
+    _HAS_NTLM = False
 
 console = Console()
 
@@ -118,7 +125,7 @@ _ROUTING_META: dict[Routing, tuple[str, str, str, str]] = {
     Routing.SOCKS_BLOCKED: ("bold magenta","magenta",   "SOCKS BLOCKED",   "Jumpbox cannot reach - possible unlisted DIA"),
     Routing.INTERNAL:      ("bold green",  "green",     "INTERNAL",        "Accessible via jumpbox VPN"),
     Routing.INTERNAL_PROXY: ("bold blue",  "blue",      "INTERNAL PROXY",   "Accessible via jumpbox VPN with proxy"),
-    Routing.EXTERNAL:      ("bold cyan",   "cyan",      "EXTERNAL",        "Needs corporate proxy on jumpbox or host"),
+    Routing.EXTERNAL:      ("bold cyan",   "cyan",      "EXTERNAL",        "Public internet domain"),
     Routing.UNRESOLVABLE:  ("dim white",   "dim",       "UNRESOLVABLE",    "No DNS from either perspective"),
 }
 
@@ -131,22 +138,37 @@ class DNSInfo:
     external_ip:  Optional[str] = None
     nameservers:  list[str]     = field(default_factory=list)
     is_private:   bool          = False
-    split_horizon: bool         = False  # local resolves private/internal, external doesn't (or gives public)
-    ip_mismatch:  bool          = False  # both resolve to different PUBLIC IPs - anycast/geo-DNS, not internal
+    split_horizon: bool         = False
+    ip_mismatch:  bool          = False
 
 
 @dataclass
 class DomainResult:
-    hostname:    str
-    routing:     Routing
-    dns:         DNSInfo
-    is_dia:      bool           = False
-    dia_reason:  str            = ""
-    via_socks:   Optional[bool] = None
-    via_proxy:   Optional[bool] = None
-    fetch_error: Optional[str]  = None
-    proxy_error: Optional[str]  = None
-    children:    dict           = field(default_factory=dict)
+    hostname:     str
+    routing:      Routing
+    dns:          DNSInfo
+    is_dia:       bool           = False
+    dia_reason:   str            = ""
+    via_socks:    Optional[bool] = None   # reachable via SSH SOCKS / jumpbox
+    via_direct:   Optional[bool] = None   # reachable directly (no proxy, no SOCKS)
+    via_proxy:    Optional[bool] = None   # reachable via corporate proxy
+    fetch_error:  Optional[str]  = None
+    direct_error: Optional[str]  = None
+    proxy_error:  Optional[str]  = None
+    proxy_page:   Optional[str]  = None   # proxy scan/block page reason if detected
+    children:     dict           = field(default_factory=dict)
+
+
+@dataclass
+class ProxyConfig:
+    """Corporate proxy settings including optional authentication."""
+    url:          str
+    username:     Optional[str]       = None
+    password:     Optional[str]       = None
+    auth_type:    str                 = "none"   # "none", "basic", "ntlm"
+    ntlm_domain:  Optional[str]       = None     # Windows domain for NTLM (e.g. CORP)
+    ntlm_dc:      Optional[str]       = None     # Domain controller hostname (informational)
+    cert_path:    Union[bool, str]    = False    # CA bundle path or False to skip verify
 
 
 ############################# PAC file parser ##############################
@@ -399,7 +421,13 @@ def ip_is_private(ip: str) -> bool:
         return False
 
 
-def classify(dns: DNSInfo, is_dia: bool, via_socks: Optional[bool], via_proxy: Optional[bool]) -> Routing:
+def classify(
+    dns:              DNSInfo,
+    is_dia:           bool,
+    via_socks:        Optional[bool],
+    via_proxy:        Optional[bool],
+    socks_configured: bool = True,
+) -> Routing:
     if is_dia:
         return Routing.DIA_REQUIRED
     if via_socks:
@@ -408,8 +436,13 @@ def classify(dns: DNSInfo, is_dia: bool, via_socks: Optional[bool], via_proxy: O
         return Routing.INTERNAL_PROXY
     if dns.is_private or dns.split_horizon:
         return Routing.INTERNAL
-    if not dns.local_ip and not dns.external_ip and not via_proxy:
+    if not dns.local_ip and not dns.external_ip:
         return Routing.UNRESOLVABLE
+    # Has resolvable public DNS
+    if not socks_configured:
+        # No jumpbox to test from — it's a regular public internet domain
+        return Routing.EXTERNAL
+    # SOCKS was configured but couldn't reach this domain
     return Routing.SOCKS_BLOCKED
 
 
@@ -542,14 +575,78 @@ def extract_domains(
     return domains
 
 ######## Proxy session helper #############################
-def _make_proxy_session(proxy_url: str) -> requests.Session:
+
+# Patterns that indicate a proxy intercepted the connection and returned its own page
+_PROXY_SCAN_SIGS: list[tuple[str, str]] = [
+    ("fortiguard",         "fortiguard web filtering"),
+    ("bluecoat",           "bluecoat systems"),
+    ("symantec proxy",     "symantec web security service"),
+    ("zscaler",            "zscaler internet security"),
+    ("cisco umbrella",     "cisco umbrella"),
+    ("cisco wsa",          "cisco web security appliance"),
+    ("squid",              "access control configuration prevents"),
+    ("mcafee",             "mcafee web gateway"),
+    ("websense",           "websense"),
+    ("clearswift",         "clearswift"),
+    ("iboss",              "iboss cloud"),
+    ("barracuda",          "barracuda web filter"),
+    ("sophos",             "sophos web appliance"),
+    ("proxy auth",         "proxy authentication required"),
+    ("palo alto",          "pan-db url filtering"),
+]
+
+_PROXY_SERVER_SIGS = {"squid", "bluecoat", "fortigate", "zscaler", "cisco", "mcafee", "iboss"}
+
+
+def _is_proxy_error_page(resp: requests.Response) -> tuple[bool, str]:
+    """Detect whether the response is a proxy scan/block/auth page rather than the real target."""
+    if resp.status_code == 407:
+        return True, "Proxy authentication required (HTTP 407)"
+
+    headers_lower = {k.lower(): v for k, v in resp.headers.items()}
+
+    if "x-squid-error" in headers_lower:
+        return True, f"Squid proxy error: {headers_lower['x-squid-error']}"
+
+    if "via" in headers_lower:
+        via = headers_lower["via"].lower()
+        for sig in _PROXY_SERVER_SIGS:
+            if sig in via:
+                return True, f"Proxy detected via Via header ({headers_lower['via']})"
+
+    server = headers_lower.get("server", "").lower()
+    for sig in _PROXY_SERVER_SIGS:
+        if sig in server:
+            return True, f"Proxy server signature in headers ({headers_lower.get('server','')})"
+
+    try:
+        body = resp.text[:8000].lower()
+    except Exception:
+        return False, ""
+
+    for name, pattern in _PROXY_SCAN_SIGS:
+        if pattern in body:
+            return True, f"Proxy scan/block page ({name})"
+
+    return False, ""
+
+
+def _make_proxy_session(cfg: ProxyConfig) -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = _UA
     s.proxies = {
-        "http": proxy_url,
-        "https": proxy_url,
+        "http":  cfg.url,
+        "https": cfg.url,
     }
+    s.verify    = cfg.cert_path
     s.trust_env = False
+
+    if cfg.auth_type == "basic" and cfg.username:
+        s.auth = requests.auth.HTTPProxyAuth(cfg.username, cfg.password or "")
+    elif cfg.auth_type == "ntlm" and _HAS_NTLM and cfg.username:
+        ntlm_user = f"{cfg.ntlm_domain}\\{cfg.username}" if cfg.ntlm_domain else cfg.username
+        s.auth = _NtlmAuth(ntlm_user, cfg.password or "")
+
     return s
 
 ############################# Core analyser ###############################
@@ -563,7 +660,7 @@ def analyse(
     timeout:       int,
     dia_set:       dict[str, str],
     fetch_ns:      bool = False,
-    proxy_url:     Optional[str] = None,
+    proxy_cfg:     Optional[ProxyConfig] = None,
 ) -> DomainResult:
 
     visited.add(hostname)
@@ -594,40 +691,78 @@ def analyse(
         dia_reason=dia_reason,
     )
 
-    if is_dia or depth >= max_depth:
+    socks_configured = socks_session is not None
+
+    if is_dia:
+        result.routing = Routing.DIA_REQUIRED
         return result
 
-    session = socks_session or requests.Session()
+    if depth >= max_depth:
+        # No HTTP tests at max depth — classify purely on DNS
+        result.routing = classify(dns_info, False, None, None, socks_configured)
+        return result
+
+    url          = f"https://{hostname}"
     fetched_resp = None
+    fetch_session = socks_session  # session used for child enumeration
 
-    url = f"https://{hostname}"
-
-    # --- SOCKS TEST
-    try:
-        resp = session.get(url, timeout=timeout, verify=False)
-        result.via_socks = True if socks_session else None
-        fetched_resp = resp
-    except Exception as exc:
-        if socks_session:
-            result.via_socks = False
+    # ── STEP 1: SOCKS / JUMPBOX ──────────────────────────────────────────────
+    if socks_session:
+        try:
+            resp = socks_session.get(url, timeout=timeout, verify=False)
+            is_scan, reason = _is_proxy_error_page(resp)
+            if is_scan:
+                result.via_socks = False
+                result.fetch_error = f"Proxy page via SOCKS: {reason}"
+            else:
+                result.via_socks = True
+                fetched_resp     = resp
+        except Exception as exc:
+            result.via_socks  = False
             result.fetch_error = str(exc)[:80]
 
-    # --- PROXY TEST (CRITICAL)
-    if proxy_url:
+    # ── STEP 2: DIRECT INTERNET (no proxy, no SOCKS) ─────────────────────────
+    if fetched_resp is None:
         try:
-            proxy_session = _make_proxy_session(proxy_url)
-            proxy_session.get(url, timeout=timeout, verify=False)
-            result.via_proxy = True
+            direct_session = requests.Session()
+            direct_session.headers["User-Agent"] = _UA
+            direct_session.trust_env = False
+            resp = direct_session.get(url, timeout=timeout, verify=False)
+            is_scan, reason = _is_proxy_error_page(resp)
+            if is_scan:
+                result.via_direct  = False
+                result.direct_error = f"Proxy page on direct: {reason}"
+            else:
+                result.via_direct = True
+                fetched_resp      = resp
+                fetch_session     = direct_session
         except Exception as exc:
-            result.via_proxy = False
-            result.proxy_error = str(exc)[:80]
+            result.via_direct  = False
+            result.direct_error = str(exc)[:80]
 
-    # --- CLASSIFY
-    result.routing = classify(dns_info, is_dia, result.via_socks, result.via_proxy)
+    # ── STEP 3: CORPORATE PROXY ───────────────────────────────────────────────
+    if proxy_cfg:
+        try:
+            proxy_session = _make_proxy_session(proxy_cfg)
+            resp = proxy_session.get(url, timeout=timeout, verify=proxy_cfg.cert_path)
+            is_scan, reason = _is_proxy_error_page(resp)
+            if is_scan:
+                result.via_proxy  = False
+                result.proxy_error = str(reason)[:120]
+                result.proxy_page  = reason
+            else:
+                result.via_proxy = True
+                if fetched_resp is None:
+                    fetched_resp  = resp
+                    fetch_session = proxy_session
+        except Exception as exc:
+            result.via_proxy  = False
+            result.proxy_error = str(exc)[:120]
 
-    # --- CHILD ENUM
-    if fetched_resp:
-        for child in extract_domains(fetched_resp, session, timeout):
+    result.routing = classify(dns_info, is_dia, result.via_socks, result.via_proxy, socks_configured)
+
+    if fetched_resp and fetch_session:
+        for child in extract_domains(fetched_resp, fetch_session, timeout):
             if child and child != hostname and child not in visited:
                 result.children[child] = analyse(
                     child,
@@ -637,7 +772,7 @@ def analyse(
                     socks_session,
                     timeout,
                     dia_set,
-                    proxy_url=proxy_url,
+                    proxy_cfg=proxy_cfg,
                 )
 
     return result
@@ -667,7 +802,13 @@ def _build_tree(result: DomainResult, node: Tree) -> None:
     for child in sorted(result.children.values(), key=lambda r: r.hostname):
         child_node = node.add(_domain_label(child))
         if child.fetch_error:
-            child_node.add(Text(f"  ⚠  {child.fetch_error}", style="dim red"))
+            child_node.add(Text(f"  ⚠  SOCKS: {child.fetch_error}", style="dim red"))
+        if child.direct_error:
+            child_node.add(Text(f"  ⚠  Direct: {child.direct_error}", style="dim yellow"))
+        if child.proxy_page:
+            child_node.add(Text(f"  ⚠  Proxy intercepted: {child.proxy_page}", style="dim magenta"))
+        elif child.proxy_error:
+            child_node.add(Text(f"  ⚠  Proxy: {child.proxy_error}", style="dim magenta"))
         if child.children:
             _build_tree(child, child_node)
 
@@ -714,20 +855,35 @@ def print_results(
     socks_port: Optional[int],
     dia_set:    dict[str, str],
     pac:        Optional[PacResult],
+    proxy_cfg:  Optional[ProxyConfig] = None,
+    socks_configured: bool = False,
 ) -> None:
     console.print()
-    proxy_label = f"SOCKS5  127.0.0.1:{socks_port} (jumpbox)" if socks_port else "local DNS only"
-    pac_label   = pac.source if pac else "none"
-    custom_dia  = [k for k, v in dia_set.items() if "Custom" in v]
+    socks_label  = f"SOCKS5  127.0.0.1:{socks_port} (jumpbox)" if socks_port else "none"
+    pac_label    = pac.source if pac else "none"
+    custom_dia   = [k for k, v in dia_set.items() if "Custom" in v]
+
+    if proxy_cfg:
+        auth_detail = ""
+        if proxy_cfg.auth_type == "ntlm":
+            dc_note = f" DC={proxy_cfg.ntlm_dc}" if proxy_cfg.ntlm_dc else ""
+            auth_detail = f"  [NTLM  user={proxy_cfg.username}  domain={proxy_cfg.ntlm_domain or '?'}{dc_note}]"
+        elif proxy_cfg.auth_type == "basic":
+            auth_detail = f"  [Basic  user={proxy_cfg.username}]"
+        cert_note = f"  cert={proxy_cfg.cert_path}" if proxy_cfg.cert_path else "  SSL verify=off"
+        proxy_label = f"{proxy_cfg.url}{auth_detail}{cert_note}"
+    else:
+        proxy_label = "none"
 
     header = (
         f"[bold white]IsItProxy - Jumpbox Routing Analyser[/bold white]\n"
-        f"[dim]Target    : {input_url}\n"
-        f"Proxy     : {proxy_label}\n"
-        f"PAC file  : {pac_label}"
+        f"[dim]Target      : {input_url}\n"
+        f"SOCKS       : {socks_label}\n"
+        f"Corp proxy  : {proxy_label}\n"
+        f"PAC file    : {pac_label}"
     )
     if custom_dia:
-        header += f"\nCustom DIA: {', '.join(sorted(custom_dia))}"
+        header += f"\nCustom DIA  : {', '.join(sorted(custom_dia))}"
     header += "[/dim]"
 
     console.print(Panel(header, box=box.DOUBLE_EDGE, style="bold blue"))
@@ -741,7 +897,13 @@ def print_results(
     console.print()
     tree = Tree(_domain_label(root))
     if root.fetch_error:
-        tree.add(Text(f"  ⚠  {root.fetch_error}", style="dim red"))
+        tree.add(Text(f"  ⚠  SOCKS: {root.fetch_error}", style="dim red"))
+    if root.direct_error:
+        tree.add(Text(f"  ⚠  Direct: {root.direct_error}", style="dim yellow"))
+    if root.proxy_page:
+        tree.add(Text(f"  ⚠  Proxy intercepted: {root.proxy_page}", style="dim magenta"))
+    elif root.proxy_error:
+        tree.add(Text(f"  ⚠  Proxy: {root.proxy_error}", style="dim magenta"))
     _build_tree(root, tree)
     console.print(tree)
     console.print()
@@ -776,7 +938,7 @@ def print_results(
 
     ############################# SOCKS blocked #
     blocked_list = sorted(by_routing[Routing.SOCKS_BLOCKED], key=lambda r: r.hostname)
-    if blocked_list:
+    if blocked_list and socks_configured:
         console.print(Rule(style="magenta"))
         pac_hint = (
             "A PAC file was loaded - these were NOT in it as DIRECT. "
@@ -797,13 +959,14 @@ def print_results(
         tbl = Table(box=box.SIMPLE, header_style="bold magenta", show_lines=False)
         tbl.add_column("Domain",           style="magenta", no_wrap=True)
         tbl.add_column("Public IP",        style="dim")
-        tbl.add_column("Error",            style="dim red")
+        tbl.add_column("Error / scan page",style="dim red")
         tbl.add_column("Suggested action", style="magenta")
         for r in blocked_list:
+            err = r.proxy_page or r.fetch_error or "-"
             tbl.add_row(
                 r.hostname,
                 r.dns.local_ip or r.dns.external_ip or "-",
-                r.fetch_error or "-",
+                err,
                 "Check PAC file; if DIA add --dia-domain",
             )
         console.print(tbl)
@@ -834,22 +997,58 @@ def print_results(
         console.print(tbl)
         console.print()
 
+    ############################# Internal + Proxy #
+    int_proxy_list = sorted(by_routing[Routing.INTERNAL_PROXY], key=lambda r: r.hostname)
+    if int_proxy_list:
+        console.print(Rule(style="blue"))
+        console.print(Panel(
+            "[bold blue]Needs Corporate Proxy (via Jumpbox)[/bold blue]\n\n"
+            "These domains are not directly reachable via the jumpbox — they require\n"
+            "the corporate proxy. Set HTTPS_PROXY on the jumpbox, or configure Burp\n"
+            "Suite with an upstream proxy rule via SOCKS5 → corporate proxy.",
+            style="blue", box=box.ROUNDED,
+        ))
+        tbl = Table(box=box.SIMPLE, header_style="bold blue", show_lines=False)
+        tbl.add_column("Domain",      style="blue",    no_wrap=True)
+        tbl.add_column("IP",          style="dim blue")
+        tbl.add_column("Proxy error / scan page", style="dim red")
+        tbl.add_column("Action",      style="dim")
+        for r in int_proxy_list:
+            err = r.proxy_page or r.proxy_error or "-"
+            tbl.add_row(
+                r.hostname,
+                r.dns.local_ip or r.dns.external_ip or "-",
+                err,
+                "HTTPS_PROXY on jumpbox",
+            )
+        console.print(tbl)
+        console.print()
+
     ############################# External #
     ext_list = sorted(by_routing[Routing.EXTERNAL], key=lambda r: r.hostname)
     if ext_list:
         console.print(Rule(style="cyan"))
-        console.print(Panel(
-            "[bold cyan]External Domains - Need Corporate Proxy on Jumpbox or Host[/bold cyan]\n"
-            "Public IPs, consistent DNS, reachable via SOCKS. Set HTTPS_PROXY on jumpbox.",
-            style="cyan", box=box.ROUNDED,
-        ))
+        if socks_configured:
+            ext_desc = (
+                "[bold cyan]External Domains - Reachable via SOCKS (Public Internet)[/bold cyan]\n"
+                "Public IPs, reachable via the jumpbox. "
+                "If the jumpbox needs a proxy to reach these, set HTTPS_PROXY on the jumpbox."
+            )
+            ext_action = "Optional: export HTTPS_PROXY=http://proxy:port on jumpbox"
+        else:
+            ext_desc = (
+                "[bold cyan]Public Internet Domains[/bold cyan]\n"
+                "Resolvable public domains. No SOCKS/jumpbox was configured — "
+                "these are standard internet-facing hosts."
+            )
+            ext_action = "No routing action required (public internet)"
+        console.print(Panel(ext_desc, style="cyan", box=box.ROUNDED))
         tbl = Table(box=box.SIMPLE, header_style="bold cyan", show_lines=False)
         tbl.add_column("Domain", style="cyan",     no_wrap=True)
         tbl.add_column("IP",     style="dim cyan")
         tbl.add_column("Action", style="dim")
         for r in ext_list:
-            tbl.add_row(r.hostname, r.dns.local_ip or r.dns.external_ip or "-",
-                        "export HTTPS_PROXY=http://proxy:port on jumpbox")
+            tbl.add_row(r.hostname, r.dns.local_ip or r.dns.external_ip or "-", ext_action)
         console.print(tbl)
         console.print()
 
@@ -869,7 +1068,8 @@ def print_results(
     console.print(Rule())
     console.print(
         "[bold green]■[/bold green] Internal (VPN)  "
-        "[bold cyan]■[/bold cyan] External (corp proxy)  "
+        "[bold blue]■[/bold blue] Needs corp proxy  "
+        "[bold cyan]■[/bold cyan] External (direct/proxy)  "
         "[bold yellow]■[/bold yellow] DIA → host network  "
         "[bold magenta]■[/bold magenta] SOCKS blocked (check PAC)  "
         "[dim]■[/dim] Unresolvable"
@@ -879,21 +1079,83 @@ def print_results(
 
 ############################# Interactive setup #############################
 
-def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], str, Optional[PacResult], Optional[str]]:
-    """
-    Returns (socks_port, target_url, pac_result_or_None).
-    socks_port_hint is pre-filled from --socks-port if given.
-    """
+def _prompt_proxy_config() -> Optional[ProxyConfig]:
+    """Ask all proxy-related questions and return a ProxyConfig or None."""
+    has_proxy = Confirm.ask(
+        "[cyan]Does the environment use a corporate proxy?[/cyan]",
+        default=True,
+    )
+    if not has_proxy:
+        return None
+
+    proxy_url = Prompt.ask("[cyan]Proxy URL[/cyan]", default="http://proxy.corp.local:8080").strip()
+
+    has_auth = Confirm.ask("[cyan]Does the proxy require authentication?[/cyan]", default=False)
+    if not has_auth:
+        has_cert = Confirm.ask("[cyan]Does the proxy use a custom TLS certificate / SSL inspection?[/cyan]", default=False)
+        cert_path: Union[bool, str] = False
+        if has_cert:
+            cp = Prompt.ask("[cyan]Path to proxy CA certificate bundle (leave blank to skip verification)[/cyan]", default="").strip()
+            cert_path = cp if cp else False
+        return ProxyConfig(url=proxy_url, cert_path=cert_path)
+
+    auth_choice = Prompt.ask(
+        "[cyan]Proxy authentication type[/cyan]",
+        choices=["basic", "ntlm"],
+        default="basic",
+    )
+
+    username = Prompt.ask("[cyan]Proxy username[/cyan]").strip()
+    password = getpass.getpass("  Proxy password: ")
+
+    ntlm_domain: Optional[str] = None
+    ntlm_dc:     Optional[str] = None
+
+    if auth_choice == "ntlm":
+        if not _HAS_NTLM:
+            console.print(
+                "[bold yellow]⚠  requests-ntlm is not installed. "
+                "Install it with: pip install requests-ntlm[/bold yellow]"
+            )
+        ntlm_domain = Prompt.ask("[cyan]Windows domain name (e.g. CORP)[/cyan]").strip() or None
+        ntlm_dc_raw = Prompt.ask(
+            "[cyan]Domain controller hostname (optional, press Enter to skip)[/cyan]", default=""
+        ).strip()
+        ntlm_dc = ntlm_dc_raw or None
+
+    has_cert = Confirm.ask("[cyan]Does the proxy use a custom TLS certificate / SSL inspection?[/cyan]", default=False)
+    cert_path = False
+    if has_cert:
+        cp = Prompt.ask("[cyan]Path to proxy CA certificate bundle (leave blank to skip verification)[/cyan]", default="").strip()
+        cert_path = cp if cp else False
+
+    return ProxyConfig(
+        url=proxy_url,
+        username=username,
+        password=password,
+        auth_type=auth_choice,
+        ntlm_domain=ntlm_domain,
+        ntlm_dc=ntlm_dc,
+        cert_path=cert_path,
+    )
+
+
+def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], str, Optional[PacResult], Optional[ProxyConfig]]:
+    """Returns (socks_port, target_url, pac_result, proxy_cfg)."""
     console.print(Panel(
         "[bold blue]IsItProxy[/bold blue] - Jumpbox Routing Analyser\n\n"
         "Runs from your [bold]local machine[/bold].\n"
-        "Uses an SSH SOCKS proxy to see domains from the jumpbox's perspective,\n"
-        "then classifies each one for Burp Suite routing.",
+        "Tests each domain from three angles:\n"
+        "  [green]1.[/green] Via jumpbox (SSH SOCKS)\n"
+        "  [cyan]2.[/cyan] Direct internet (no proxy)\n"
+        "  [blue]3.[/blue] Via corporate proxy\n\n"
+        "Classifies each domain for Burp Suite routing.",
         box=box.ROUNDED, style="blue",
     ))
     console.print()
 
     socks_port: Optional[int] = socks_port_hint
+    pac_result: Optional[PacResult] = None
 
     from_local = Confirm.ask(
         "[cyan]Are you running this from an off-network machine?[/cyan]",
@@ -910,7 +1172,7 @@ def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], st
 
         if has_socks:
             if socks_port is None:
-                port_str  = Prompt.ask("[cyan]SOCKS proxy port[/cyan]", default="1080")
+                port_str = Prompt.ask("[cyan]SOCKS proxy port[/cyan]", default="1080")
                 try:
                     socks_port = int(port_str)
                 except ValueError:
@@ -928,38 +1190,28 @@ def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], st
                     if not Confirm.ask("[cyan]Continue anyway?[/cyan]", default=False):
                         sys.exit(0)
         else:
-            console.print("[yellow]No SOCKS proxy - DNS reflects your local machine.[/yellow]")
+            console.print("[yellow]No SOCKS proxy - jumpbox perspective unavailable.[/yellow]")
     else:
         console.print("[yellow]Running without SOCKS proxy. DNS reflects your machine's resolvers.[/yellow]")
 
-        # PAC file
-        console.print()
-        pac_result: Optional[PacResult] = None
-        has_pac = Confirm.ask(
-            "[cyan]Do you have access to a PAC file? (local path or URL)[/cyan]",
-            default=False,
-        )
-        if has_pac:
-            pac_source = Prompt.ask("[cyan]PAC file path or URL[/cyan]").strip()
-            pac_result = _try_load_pac(pac_source, socks_port)
-
+    # PAC file — always offered regardless of network mode
     console.print()
-    proxy_url = None
-
-    has_proxy = Confirm.ask(
-        "[cyan]Does the environment require a corporate proxy for external access?[/cyan]",
-        default=True,
+    has_pac = Confirm.ask(
+        "[cyan]Do you have access to a PAC file? (local path or URL)[/cyan]",
+        default=False,
     )
+    if has_pac:
+        pac_source = Prompt.ask("[cyan]PAC file path or URL[/cyan]").strip()
+        pac_result = _try_load_pac(pac_source, socks_port)
 
-    if has_proxy:
-        proxy_url = Prompt.ask(
-            "[cyan]Proxy URL (e.g. http://proxy.corp.local:8080)[/cyan]"
-        )
+    # Proxy config — always offered
+    console.print()
+    proxy_cfg = _prompt_proxy_config()
 
     console.print()
     target = Prompt.ask("[cyan]Target URL or hostname[/cyan]").strip()
 
-    return socks_port, target, pac_result, proxy_url
+    return socks_port, target, pac_result, proxy_cfg
 
 
 def _try_load_pac(source: str, socks_port: Optional[int]) -> Optional[PacResult]:
@@ -1115,20 +1367,27 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Interactive (recommended - walks you through SOCKS + PAC setup)
+  # Interactive (recommended)
   python IsItProxy.py
 
-  # Non-interactive with SOCKS + PAC file (auto-detects all DIA domains)
+  # Non-interactive with SOCKS + PAC file
   python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \\
       --pac-file /path/to/proxy.pac
 
-  # Fetch PAC from a URL (e.g. via the SOCKS tunnel to an internal PAC server)
+  # With authenticated proxy (Basic)
   python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \\
-      --pac-url http://wpad.corp.local/proxy.pac
+      --proxy http://proxy.corp.local:8080 --proxy-user jsmith \\
+      --proxy-pass secret --proxy-auth basic
 
-  # Manually specify extra DIA domains on top of PAC
+  # With authenticated proxy (NTLM)
   python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \\
-      --pac-file proxy.pac --dia-domain okta.com --dia-domain auth0.com
+      --proxy http://proxy.corp.local:8080 --proxy-user jsmith \\
+      --proxy-pass secret --proxy-auth ntlm --proxy-domain CORP \\
+      --proxy-dc dc01.corp.local
+
+  # With proxy SSL inspection CA cert
+  python IsItProxy.py --url https://portal.corp.local --socks-port 1080 \\
+      --proxy http://proxy.corp.local:8080 --proxy-cert /path/to/ca-bundle.pem
 
   # No SOCKS, no PAC, DNS-only
   python IsItProxy.py --url portal.corp.local --no-socks --depth 0
@@ -1153,36 +1412,69 @@ Examples:
                         help="Crawl depth (default: 2; 0 = DNS + NS only)")
     parser.add_argument("--timeout",   type=int, default=10, metavar="SEC",
                         help="Per-request HTTP timeout (default: 10)")
+    # Proxy auth arguments
+    parser.add_argument("--proxy",      metavar="URL",
+                        help="Corporate proxy URL (e.g. http://proxy.corp.local:8080)")
+    parser.add_argument("--proxy-user", metavar="USER",  help="Proxy username")
+    parser.add_argument("--proxy-pass", metavar="PASS",  help="Proxy password")
+    parser.add_argument("--proxy-auth", metavar="TYPE",  choices=["none", "basic", "ntlm"],
+                        default="none", help="Proxy auth type: none, basic, ntlm (default: none)")
+    parser.add_argument("--proxy-domain", metavar="DOMAIN",
+                        help="Windows domain for NTLM proxy auth (e.g. CORP)")
+    parser.add_argument("--proxy-dc",   metavar="HOST",
+                        help="Domain controller hostname for NTLM proxy auth (optional)")
+    parser.add_argument("--proxy-cert", metavar="FILE",
+                        help="CA certificate bundle for proxy TLS verification")
     args = parser.parse_args()
 
     # Determine mode
-    pac_source   = args.pac_file or args.pac_url
+    pac_source     = args.pac_file or args.pac_url
     fully_scripted = args.url is not None and (args.socks_port is not None or args.no_socks)
 
-    pac_result: Optional[PacResult] = None
+    pac_result: Optional[PacResult]  = None
+    proxy_cfg:  Optional[ProxyConfig] = None
 
     if fully_scripted:
         target     = args.url
         socks_port = None if args.no_socks else args.socks_port
         if pac_source:
             pac_result = _try_load_pac(pac_source, socks_port)
+        if args.proxy:
+            proxy_cfg = ProxyConfig(
+                url         = args.proxy,
+                username    = args.proxy_user,
+                password    = args.proxy_pass,
+                auth_type   = args.proxy_auth,
+                ntlm_domain = args.proxy_domain,
+                ntlm_dc     = args.proxy_dc,
+                cert_path   = args.proxy_cert or False,
+            )
     else:
-        socks_port, target, pac_result, proxy_url = interactive_setup(
+        socks_port, target, pac_result, proxy_cfg = interactive_setup(
             socks_port_hint=args.socks_port if not args.no_socks else None,
         )
-        # CLI --url overrides the interactive prompt
         if args.url:
             target = args.url
-        # CLI PAC overrides the interactive PAC (if both given)
         if pac_source and pac_result is None:
             pac_result = _try_load_pac(pac_source, socks_port)
+        # CLI proxy args override interactive proxy config
+        if args.proxy:
+            proxy_cfg = ProxyConfig(
+                url         = args.proxy,
+                username    = args.proxy_user,
+                password    = args.proxy_pass,
+                auth_type   = args.proxy_auth,
+                ntlm_domain = args.proxy_domain,
+                ntlm_dc     = args.proxy_dc,
+                cert_path   = args.proxy_cert or False,
+            )
 
     # Build DIA set
     dia_set = build_dia_set(
-        extra_domains    = args.dia_domain,
-        dia_file         = args.dia_file,
-        pac_result       = pac_result,
-        include_builtin  = not args.no_builtin_dia,
+        extra_domains   = args.dia_domain,
+        dia_file        = args.dia_file,
+        pac_result      = pac_result,
+        include_builtin = not args.no_builtin_dia,
     )
 
     # Normalise URL
@@ -1195,10 +1487,16 @@ Examples:
 
     session = _make_session(socks_port)
 
+    proxy_label = "none"
+    if proxy_cfg:
+        auth_label  = f" [{proxy_cfg.auth_type}]" if proxy_cfg.auth_type != "none" else ""
+        proxy_label = f"{proxy_cfg.url}{auth_label}"
+
     console.print(
         f"\n[bold blue]Analysing[/bold blue]  [cyan]{hostname}[/cyan]  "
         f"depth=[cyan]{args.depth}[/cyan]  "
-        f"proxy=[cyan]{'socks5h://127.0.0.1:' + str(socks_port) if socks_port else 'none'}[/cyan]  "
+        f"socks=[cyan]{'127.0.0.1:' + str(socks_port) if socks_port else 'none'}[/cyan]  "
+        f"corp-proxy=[cyan]{proxy_label}[/cyan]  "
         f"DIA domains=[cyan]{len(dia_set)}[/cyan]"
     )
 
@@ -1213,10 +1511,10 @@ Examples:
             args.timeout,
             dia_set,
             fetch_ns=True,
-            proxy_url=proxy_url,
+            proxy_cfg=proxy_cfg,
         )
 
-    print_results(root, target, socks_port, dia_set, pac_result)
+    print_results(root, target, socks_port, dia_set, pac_result, proxy_cfg, socks_configured=bool(socks_port))
 
     # Generate Burp Suite upstream proxy config
     all_r: dict[str, DomainResult] = {}
