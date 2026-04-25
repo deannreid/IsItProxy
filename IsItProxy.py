@@ -42,6 +42,15 @@ except ImportError:
     _HAS_NTLM = False
 
 console = Console()
+_debug:              bool = False
+_verbose:            bool = False
+_verbose_max_pages:   int = 20
+_bypass_proxy_test:  bool = False
+
+
+def _dbg(msg: str, indent: int = 0) -> None:
+    if _debug:
+        console.print(f"[dim cyan]{'  ' * indent}[DBG] {msg}[/dim cyan]")
 
 ############################# Built-in DIA apex domains #########################
 # Microsoft / Entra SSO domains that are almost universally DIA.
@@ -152,11 +161,13 @@ class DomainResult:
     via_socks:    Optional[bool] = None   # reachable via SSH SOCKS / jumpbox
     via_direct:   Optional[bool] = None   # reachable directly (no proxy, no SOCKS)
     via_proxy:    Optional[bool] = None   # reachable via corporate proxy
-    fetch_error:  Optional[str]  = None
-    direct_error: Optional[str]  = None
-    proxy_error:  Optional[str]  = None
-    proxy_page:   Optional[str]  = None   # proxy scan/block page reason if detected
-    children:     dict           = field(default_factory=dict)
+    fetch_error:    Optional[str]  = None
+    direct_error:   Optional[str]  = None
+    proxy_error:    Optional[str]  = None
+    proxy_page:     Optional[str]  = None   # proxy scan/block page reason if detected
+    redirect_chain:  list[str]                    = field(default_factory=list)
+    bypass_results:  list[tuple[str, bool, str]]  = field(default_factory=list)  # (method, success, detail)
+    children:        dict                         = field(default_factory=dict)
 
 
 @dataclass
@@ -574,6 +585,118 @@ def extract_domains(
     domains.discard("")
     return domains
 
+######## Windows proxy auto-detection ####################
+
+def _detect_windows_proxy() -> tuple[Optional[str], Optional[str]]:
+    """
+    Read the current user's proxy settings from the Windows registry
+    (Internet Options → Connections → LAN Settings).
+    Returns (proxy_url_or_None, pac_url_or_None).
+    Only meaningful on Windows.
+    """
+    if sys.platform != "win32":
+        return None, None
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+
+        proxy_url: Optional[str] = None
+        pac_url:   Optional[str] = None
+
+        try:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if enabled:
+                server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                if server:
+                    # May be "host:port" or "http=host:port;https=host:port;..."
+                    if "=" in server:
+                        for part in server.split(";"):
+                            if part.startswith("https="):
+                                proxy_url = "http://" + part[6:]
+                                break
+                            if part.startswith("http="):
+                                proxy_url = "http://" + part[5:]
+                        if not proxy_url:
+                            # Fallback: first entry
+                            proxy_url = "http://" + server.split(";")[0].split("=")[-1]
+                    else:
+                        proxy_url = f"http://{server}"
+        except FileNotFoundError:
+            pass
+
+        try:
+            pac, _ = winreg.QueryValueEx(key, "AutoConfigURL")
+            if pac:
+                pac_url = pac
+        except FileNotFoundError:
+            pass
+
+        winreg.CloseKey(key)
+        return proxy_url, pac_url
+    except Exception:
+        return None, None
+
+
+######## Redirect-aware fetch ############################
+
+def _fetch_with_redirect_tracking(
+    start_url: str,
+    session:   requests.Session,
+    timeout:   int,
+    verify     = False,
+    label:     str = "",
+) -> tuple[Optional[requests.Response], list[str], Optional[str]]:
+    """
+    Follow redirects manually, recording every hop hostname.
+    Returns (final_response_or_None, hostname_chain, error_or_None).
+
+    Unlike allow_redirects=True, this captures each hop even when a later
+    redirect target is unreachable — critical for SSO chains that end at a
+    DIA domain the jumpbox cannot reach.
+    """
+    chain:       list[str] = []
+    current_url: str       = start_url
+
+    for hop in range(15):
+        parsed = urlparse(current_url)
+        h      = (parsed.hostname or "").lower()
+        if h and h not in chain:
+            chain.append(h)
+
+        try:
+            resp = session.get(current_url, timeout=timeout, verify=verify,
+                               allow_redirects=False)
+        except Exception as exc:
+            _dbg(f"{label} hop {hop} {current_url} -> ERROR: {exc}", indent=2)
+            return None, chain, str(exc)
+
+        _dbg(f"{label} hop {hop} {current_url} -> HTTP {resp.status_code}", indent=2)
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location", "").strip()
+            if not loc:
+                return resp, chain, None
+            # Resolve relative redirects
+            if loc.startswith("//"):
+                loc = f"{parsed.scheme}:{loc}"
+            elif loc.startswith("/"):
+                loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
+            elif not loc.startswith(("http://", "https://")):
+                loc = f"{parsed.scheme}://{parsed.netloc}/{loc.lstrip('/')}"
+            loc_host = (urlparse(loc).hostname or "").lower()
+            if loc_host and loc_host not in chain:
+                chain.append(loc_host)
+                _dbg(f"{label}   -> redirect to {loc_host}", indent=2)
+            current_url = loc
+        else:
+            return resp, chain, None
+
+    return None, chain, "Too many redirects"
+
+
 ######## Proxy session helper #############################
 
 # Patterns that indicate a proxy intercepted the connection and returned its own page
@@ -649,6 +772,134 @@ def _make_proxy_session(cfg: ProxyConfig) -> requests.Session:
 
     return s
 
+############################# Proxy bypass tester ########################
+
+def _test_proxy_bypass(
+    hostname:  str,
+    ip:        str,
+    timeout:   int,
+    proxy_cfg: Optional[ProxyConfig] = None,
+    port:      Optional[int] = None,
+) -> list[tuple[str, bool, str]]:
+    """
+    Attempt to reach a blocked domain by connecting to its IP directly,
+    bypassing hostname-based proxy filtering.
+
+    Tries four combinations: {http,https} x {direct, via-proxy}.
+    Sets Host: header so virtual-hosted servers respond correctly.
+
+    Returns list of (method_label, success, detail).
+    """
+    results: list[tuple[str, bool, str]] = []
+
+    for scheme in ("https", "http"):
+        default_port = 443 if scheme == "https" else 80
+        p = port or default_port
+        ip_url = f"{scheme}://{ip}" + (f":{p}" if p != default_port else "")
+
+        # ── Direct IP (no proxy) ──────────────────────────────────────────
+        try:
+            s = requests.Session()
+            s.headers.update({"User-Agent": _UA, "Host": hostname})
+            s.trust_env = False
+            resp = s.get(ip_url, timeout=timeout, verify=False, allow_redirects=False)
+            is_block, reason = _is_proxy_error_page(resp)
+            if not is_block and resp.status_code < 500:
+                results.append((f"Direct IP ({scheme})", True,
+                                 f"HTTP {resp.status_code} — bypass likely successful"))
+            else:
+                results.append((f"Direct IP ({scheme})", False,
+                                 reason or f"HTTP {resp.status_code}"))
+        except Exception as exc:
+            results.append((f"Direct IP ({scheme})", False, str(exc)[:100]))
+
+        # ── Via proxy using IP ────────────────────────────────────────────
+        if proxy_cfg:
+            try:
+                s = _make_proxy_session(proxy_cfg)
+                s.headers["Host"] = hostname
+                resp = s.get(ip_url, timeout=timeout, verify=proxy_cfg.cert_path,
+                             allow_redirects=False)
+                is_block, reason = _is_proxy_error_page(resp)
+                if not is_block and resp.status_code < 500:
+                    results.append((f"Via proxy IP ({scheme})", True,
+                                     f"HTTP {resp.status_code} — proxy hostname filter bypassed"))
+                else:
+                    results.append((f"Via proxy IP ({scheme})", False,
+                                     reason or f"HTTP {resp.status_code}"))
+            except Exception as exc:
+                results.append((f"Via proxy IP ({scheme})", False, str(exc)[:100]))
+
+    _dbg(f"  bypass results for {hostname} ({ip}): {results}", indent=1)
+    return results
+
+
+############################# Same-origin page crawler ####################
+
+def _page_links(response: requests.Response, base_url: str) -> set[str]:
+    """Return absolute same-origin URLs found in <a href> tags."""
+    from urllib.parse import urljoin, urlunparse
+    links: set[str] = set()
+    parsed_base = urlparse(base_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    try:
+        soup = BeautifulSoup(response.content, "lxml")
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"].strip()
+            if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                continue
+            full = urljoin(base_url, href)
+            p = urlparse(full)
+            if f"{p.scheme}://{p.netloc}" != origin:
+                continue
+            clean = urlunparse((p.scheme, p.netloc, p.path, p.params, p.query, ""))
+            links.add(clean)
+    except Exception:
+        pass
+    return links
+
+
+def _crawl_same_origin(
+    start_resp: requests.Response,
+    start_url:  str,
+    session:    requests.Session,
+    timeout:    int,
+    max_pages:  int,
+) -> set[str]:
+    """
+    BFS crawl of same-origin pages reachable via <a href> links.
+    Returns the union of all hostnames found across all crawled pages.
+    """
+    all_domains:   set[str] = set()
+    visited_pages: set[str] = {start_url}
+    queue:         list[str] = list(_page_links(start_resp, start_url))
+
+    _dbg(f"  verbose: {len(queue)} page link(s) found on {start_url}", indent=1)
+
+    while queue and len(visited_pages) < max_pages + 1:
+        page_url = queue.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        _dbg(f"  verbose: crawling page {page_url}", indent=1)
+        resp, _, err = _fetch_with_redirect_tracking(page_url, session, timeout, False, "verbose")
+        if resp is None:
+            _dbg(f"  verbose: failed — {err}", indent=1)
+            continue
+
+        extracted = extract_domains(resp, session, timeout)
+        _dbg(f"  verbose: {len(extracted)} domain(s) on {page_url}", indent=1)
+        all_domains |= extracted
+
+        for link in _page_links(resp, page_url):
+            if link not in visited_pages:
+                queue.append(link)
+
+    _dbg(f"  verbose: crawled {len(visited_pages) - 1} extra page(s), found {len(all_domains)} domain(s)", indent=1)
+    return all_domains
+
+
 ############################# Core analyser ###############################
 
 def analyse(
@@ -661,6 +912,7 @@ def analyse(
     dia_set:       dict[str, str],
     fetch_ns:      bool = False,
     proxy_cfg:     Optional[ProxyConfig] = None,
+    start_url:     Optional[str] = None,
 ) -> DomainResult:
 
     visited.add(hostname)
@@ -693,42 +945,61 @@ def analyse(
 
     socks_configured = socks_session is not None
 
+    _dbg(f"analyse({hostname!r}, depth={depth})")
+    _dbg(f"  DNS local={local_ip!r}  external={external_ip!r}  private={priv}  split={split}", indent=1)
+
     if is_dia:
+        _dbg(f"  DIA: {dia_reason}", indent=1)
         result.routing = Routing.DIA_REQUIRED
         return result
 
     if depth >= max_depth:
-        # No HTTP tests at max depth — classify purely on DNS
         result.routing = classify(dns_info, False, None, None, socks_configured)
+        _dbg(f"  max_depth -> {result.routing.name}", indent=1)
         return result
 
-    url          = f"https://{hostname}"
-    fetched_resp = None
-    fetch_session = socks_session  # session used for child enumeration
+    # Use the caller-supplied start URL (preserves port + path) for the root
+    # domain; fall back to plain https://hostname for child domains.
+    url = start_url if start_url else f"https://{hostname}"
+    fetched_resp   = None
+    fetch_session  = socks_session
+    redirect_hosts: set[str] = set()   # hostnames seen in redirect chains across all steps
 
     # ── STEP 1: SOCKS / JUMPBOX ──────────────────────────────────────────────
     if socks_session:
-        try:
-            resp = socks_session.get(url, timeout=timeout, verify=False)
+        _dbg(f"  [1] SOCKS  {url}", indent=1)
+        resp, chain, err = _fetch_with_redirect_tracking(url, socks_session, timeout, False, "SOCKS")
+        redirect_hosts.update(chain)
+        result.redirect_chain = chain
+        if resp is not None:
             is_scan, reason = _is_proxy_error_page(resp)
+            _dbg(f"  [1] HTTP {resp.status_code}  scan={is_scan}  final={resp.url}", indent=1)
             if is_scan:
-                result.via_socks = False
+                result.via_socks  = False
                 result.fetch_error = f"Proxy page via SOCKS: {reason}"
+                _dbg(f"  [1] scan page: {reason}", indent=1)
             else:
                 result.via_socks = True
                 fetched_resp     = resp
-        except Exception as exc:
+        else:
             result.via_socks  = False
-            result.fetch_error = str(exc)[:80]
+            result.fetch_error = (err or "")[:80] if not _debug else err
+            _dbg(f"  [1] FAILED: {err}", indent=1)
+        _dbg(f"  [1] redirect chain: {chain}", indent=1)
 
     # ── STEP 2: DIRECT INTERNET (no proxy, no SOCKS) ─────────────────────────
     if fetched_resp is None:
-        try:
-            direct_session = requests.Session()
-            direct_session.headers["User-Agent"] = _UA
-            direct_session.trust_env = False
-            resp = direct_session.get(url, timeout=timeout, verify=False)
+        _dbg(f"  [2] Direct {url}", indent=1)
+        direct_session = requests.Session()
+        direct_session.headers["User-Agent"] = _UA
+        direct_session.trust_env = False
+        resp, chain, err = _fetch_with_redirect_tracking(url, direct_session, timeout, False, "Direct")
+        redirect_hosts.update(chain)
+        if not result.redirect_chain:
+            result.redirect_chain = chain
+        if resp is not None:
             is_scan, reason = _is_proxy_error_page(resp)
+            _dbg(f"  [2] HTTP {resp.status_code}  scan={is_scan}  final={resp.url}", indent=1)
             if is_scan:
                 result.via_direct  = False
                 result.direct_error = f"Proxy page on direct: {reason}"
@@ -736,16 +1007,25 @@ def analyse(
                 result.via_direct = True
                 fetched_resp      = resp
                 fetch_session     = direct_session
-        except Exception as exc:
+        else:
             result.via_direct  = False
-            result.direct_error = str(exc)[:80]
+            result.direct_error = (err or "")[:80] if not _debug else err
+            _dbg(f"  [2] FAILED: {err}", indent=1)
+        _dbg(f"  [2] redirect chain: {chain}", indent=1)
 
     # ── STEP 3: CORPORATE PROXY ───────────────────────────────────────────────
     if proxy_cfg:
-        try:
-            proxy_session = _make_proxy_session(proxy_cfg)
-            resp = proxy_session.get(url, timeout=timeout, verify=proxy_cfg.cert_path)
+        _dbg(f"  [3] Proxy  {url}  ({proxy_cfg.url}  auth={proxy_cfg.auth_type})", indent=1)
+        proxy_session = _make_proxy_session(proxy_cfg)
+        resp, chain, err = _fetch_with_redirect_tracking(
+            url, proxy_session, timeout, proxy_cfg.cert_path, "Proxy"
+        )
+        redirect_hosts.update(chain)
+        if not result.redirect_chain:
+            result.redirect_chain = chain
+        if resp is not None:
             is_scan, reason = _is_proxy_error_page(resp)
+            _dbg(f"  [3] HTTP {resp.status_code}  scan={is_scan}  final={resp.url}", indent=1)
             if is_scan:
                 result.via_proxy  = False
                 result.proxy_error = str(reason)[:120]
@@ -755,25 +1035,58 @@ def analyse(
                 if fetched_resp is None:
                     fetched_resp  = resp
                     fetch_session = proxy_session
-        except Exception as exc:
+        else:
             result.via_proxy  = False
-            result.proxy_error = str(exc)[:120]
+            result.proxy_error = (err or "")[:120] if not _debug else err
+            _dbg(f"  [3] FAILED: {err}", indent=1)
+        _dbg(f"  [3] redirect chain: {chain}", indent=1)
 
+    # ── CLASSIFY ─────────────────────────────────────────────────────────────
     result.routing = classify(dns_info, is_dia, result.via_socks, result.via_proxy, socks_configured)
+    _dbg(f"  routing -> {result.routing.name}  (socks={result.via_socks} direct={result.via_direct} proxy={result.via_proxy})", indent=1)
+
+    # ── BYPASS TEST ──────────────────────────────────────────────────────────
+    # Trigger when proxy blocked the page, or when SOCKS can't reach it and we
+    # have an IP to try.
+    if _bypass_proxy_test and (result.proxy_page or result.routing == Routing.SOCKS_BLOCKED):
+        ip = local_ip or external_ip
+        if ip and not ip_is_private(ip):
+            _dbg(f"  running bypass test for {hostname} ({ip})", indent=1)
+            result.bypass_results = _test_proxy_bypass(
+                hostname, ip, timeout, proxy_cfg, port
+            )
+
+    # ── CHILD ENUM ───────────────────────────────────────────────────────────
+    # Seed with hostnames seen in redirect chains across all fetch attempts
+    child_hosts: set[str] = set(redirect_hosts)
 
     if fetched_resp and fetch_session:
-        for child in extract_domains(fetched_resp, fetch_session, timeout):
-            if child and child != hostname and child not in visited:
-                result.children[child] = analyse(
-                    child,
-                    depth + 1,
-                    max_depth,
-                    visited,
-                    socks_session,
-                    timeout,
-                    dia_set,
-                    proxy_cfg=proxy_cfg,
-                )
+        final_host = (urlparse(fetched_resp.url).hostname or "").lower()
+        _dbg(f"  extracting domains from response (final URL host: {final_host!r})", indent=1)
+        extracted = extract_domains(fetched_resp, fetch_session, timeout)
+        child_hosts.update(extracted)
+        _dbg(f"  extracted {len(extracted)} domain(s) from response body", indent=1)
+
+        if _verbose:
+            verbose_domains = _crawl_same_origin(
+                fetched_resp, url, fetch_session, timeout, _verbose_max_pages
+            )
+            child_hosts.update(verbose_domains)
+
+    _dbg(f"  total child candidates: {len(child_hosts)}", indent=1)
+
+    for child in sorted(child_hosts):
+        if child and child != hostname and child not in visited:
+            result.children[child] = analyse(
+                child,
+                depth + 1,
+                max_depth,
+                visited,
+                socks_session,
+                timeout,
+                dia_set,
+                proxy_cfg=proxy_cfg,
+            )
 
     return result
 
@@ -801,14 +1114,22 @@ def _domain_label(r: DomainResult) -> Text:
 def _build_tree(result: DomainResult, node: Tree) -> None:
     for child in sorted(result.children.values(), key=lambda r: r.hostname):
         child_node = node.add(_domain_label(child))
+        # Show redirect chain if it involves more than just this domain
+        redir_other = [h for h in child.redirect_chain if h != child.hostname]
+        if redir_other:
+            child_node.add(Text(f"  -> redirects: {' -> '.join(child.redirect_chain)}", style="dim blue"))
         if child.fetch_error:
-            child_node.add(Text(f"  ⚠  SOCKS: {child.fetch_error}", style="dim red"))
+            child_node.add(Text(f"  ! SOCKS: {child.fetch_error}", style="dim red"))
         if child.direct_error:
-            child_node.add(Text(f"  ⚠  Direct: {child.direct_error}", style="dim yellow"))
+            child_node.add(Text(f"  ! Direct: {child.direct_error}", style="dim yellow"))
         if child.proxy_page:
-            child_node.add(Text(f"  ⚠  Proxy intercepted: {child.proxy_page}", style="dim magenta"))
+            child_node.add(Text(f"  ! Proxy intercepted: {child.proxy_page}", style="dim magenta"))
         elif child.proxy_error:
-            child_node.add(Text(f"  ⚠  Proxy: {child.proxy_error}", style="dim magenta"))
+            child_node.add(Text(f"  ! Proxy: {child.proxy_error}", style="dim magenta"))
+        for method, success, detail in child.bypass_results:
+            style = "bold green" if success else "dim red"
+            icon  = "[BYPASS OK]" if success else "[bypass fail]"
+            child_node.add(Text(f"  {icon} {method}: {detail}", style=style))
         if child.children:
             _build_tree(child, child_node)
 
@@ -896,14 +1217,21 @@ def print_results(
 
     console.print()
     tree = Tree(_domain_label(root))
+    redir_other = [h for h in root.redirect_chain if h != root.hostname]
+    if redir_other:
+        tree.add(Text(f"  -> redirects: {' -> '.join(root.redirect_chain)}", style="dim blue"))
     if root.fetch_error:
-        tree.add(Text(f"  ⚠  SOCKS: {root.fetch_error}", style="dim red"))
+        tree.add(Text(f"  ! SOCKS: {root.fetch_error}", style="dim red"))
     if root.direct_error:
-        tree.add(Text(f"  ⚠  Direct: {root.direct_error}", style="dim yellow"))
+        tree.add(Text(f"  ! Direct: {root.direct_error}", style="dim yellow"))
     if root.proxy_page:
-        tree.add(Text(f"  ⚠  Proxy intercepted: {root.proxy_page}", style="dim magenta"))
+        tree.add(Text(f"  ! Proxy intercepted: {root.proxy_page}", style="dim magenta"))
     elif root.proxy_error:
-        tree.add(Text(f"  ⚠  Proxy: {root.proxy_error}", style="dim magenta"))
+        tree.add(Text(f"  ! Proxy: {root.proxy_error}", style="dim magenta"))
+    for method, success, detail in root.bypass_results:
+        style = "bold green" if success else "dim red"
+        icon  = "[BYPASS OK]" if success else "[bypass fail]"
+        tree.add(Text(f"  {icon} {method}: {detail}", style=style))
     _build_tree(root, tree)
     console.print(tree)
     console.print()
@@ -1052,6 +1380,28 @@ def print_results(
         console.print(tbl)
         console.print()
 
+    ############################# Bypass results #
+    bypass_hits = [(r, m, d) for r in all_r.values()
+                   for m, ok, d in r.bypass_results if ok]
+    if bypass_hits:
+        console.print(Rule(style="bold green"))
+        console.print(Panel(
+            "[bold green]Proxy Bypass Opportunities Detected[/bold green]\n\n"
+            "The following domains were reachable by IP when the hostname was blocked.\n"
+            "This may indicate hostname-based (not IP-based) proxy filtering.",
+            style="green", box=box.ROUNDED,
+        ))
+        tbl = Table(box=box.SIMPLE, header_style="bold green", show_lines=False)
+        tbl.add_column("Domain",   style="green",     no_wrap=True)
+        tbl.add_column("IP used",  style="dim green")
+        tbl.add_column("Method",   style="cyan")
+        tbl.add_column("Detail",   style="dim")
+        for r, method, detail in sorted(bypass_hits, key=lambda x: x[0].hostname):
+            ip = r.dns.local_ip or r.dns.external_ip or "-"
+            tbl.add_row(r.hostname, ip, method, detail)
+        console.print(tbl)
+        console.print()
+
     ############################# Unresolvable #
     dead_list = sorted(by_routing[Routing.UNRESOLVABLE], key=lambda r: r.hostname)
     if dead_list:
@@ -1193,6 +1543,62 @@ def interactive_setup(socks_port_hint: Optional[int]) -> tuple[Optional[int], st
             console.print("[yellow]No SOCKS proxy - jumpbox perspective unavailable.[/yellow]")
     else:
         console.print("[yellow]Running without SOCKS proxy. DNS reflects your machine's resolvers.[/yellow]")
+
+        # On-network Windows machine: auto-detect proxy and PAC from system settings
+        if sys.platform == "win32":
+            detected_proxy, detected_pac = _detect_windows_proxy()
+            if detected_proxy or detected_pac:
+                console.print()
+                console.print("[bold cyan]Windows proxy settings detected:[/bold cyan]")
+                if detected_proxy:
+                    console.print(f"  Proxy : [cyan]{detected_proxy}[/cyan]")
+                if detected_pac:
+                    console.print(f"  PAC   : [cyan]{detected_pac}[/cyan]")
+                use_detected = Confirm.ask(
+                    "[cyan]Use these settings automatically?[/cyan]", default=True
+                )
+                if use_detected:
+                    if detected_pac and pac_result is None:
+                        pac_result = _try_load_pac(detected_pac, socks_port)
+                    if detected_proxy:
+                        console.print()
+                        has_proxy_auth = Confirm.ask(
+                            "[cyan]Does the detected proxy require authentication?[/cyan]",
+                            default=False,
+                        )
+                        if has_proxy_auth:
+                            _auto_proxy = _prompt_proxy_config.__wrapped__ if hasattr(_prompt_proxy_config, "__wrapped__") else None
+                            # Re-use the full auth prompt but with pre-filled URL
+                            console.print(f"[dim]Using proxy URL: {detected_proxy}[/dim]")
+                            auth_choice = Prompt.ask(
+                                "[cyan]Proxy authentication type[/cyan]",
+                                choices=["basic", "ntlm"],
+                                default="ntlm",
+                            )
+                            username = Prompt.ask("[cyan]Proxy username[/cyan]").strip()
+                            password = getpass.getpass("  Proxy password: ")
+                            ntlm_domain: Optional[str] = None
+                            ntlm_dc:     Optional[str] = None
+                            if auth_choice == "ntlm":
+                                ntlm_domain = Prompt.ask("[cyan]Windows domain (e.g. CORP)[/cyan]").strip() or None
+                                ntlm_dc_raw = Prompt.ask("[cyan]Domain controller (optional)[/cyan]", default="").strip()
+                                ntlm_dc = ntlm_dc_raw or None
+                            has_cert = Confirm.ask("[cyan]Custom proxy TLS certificate?[/cyan]", default=False)
+                            cert_path_val: Union[bool, str] = False
+                            if has_cert:
+                                cp = Prompt.ask("[cyan]CA bundle path (blank = skip verify)[/cyan]", default="").strip()
+                                cert_path_val = cp if cp else False
+                            _auto_proxy_cfg = ProxyConfig(
+                                url=detected_proxy, username=username, password=password,
+                                auth_type=auth_choice, ntlm_domain=ntlm_domain,
+                                ntlm_dc=ntlm_dc, cert_path=cert_path_val,
+                            )
+                        else:
+                            _auto_proxy_cfg = ProxyConfig(url=detected_proxy)
+                        # Return early from proxy prompt section below
+                        console.print()
+                        target = Prompt.ask("[cyan]Target URL or hostname[/cyan]").strip()
+                        return socks_port, target, pac_result, _auto_proxy_cfg
 
     # PAC file — always offered regardless of network mode
     console.print()
@@ -1425,7 +1831,27 @@ Examples:
                         help="Domain controller hostname for NTLM proxy auth (optional)")
     parser.add_argument("--proxy-cert", metavar="FILE",
                         help="CA certificate bundle for proxy TLS verification")
+    parser.add_argument("--debug", action="store_true",
+                        help="Verbose debug output: DNS, redirect chains, HTTP status per step")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Crawl same-origin <a href> links on each page to discover more domains")
+    parser.add_argument("--max-pages", type=int, default=20, metavar="N",
+                        help="Max same-origin pages to crawl in verbose mode (default: 20)")
+    parser.add_argument("--bypass-proxy-test", action="store_true",
+                        help="When a proxy blocks a domain, attempt access via resolved IP to test "
+                             "for hostname-based filter bypass")
     args = parser.parse_args()
+
+    if args.debug:
+        global _debug
+        _debug = True
+    if args.verbose:
+        global _verbose, _verbose_max_pages
+        _verbose = True
+        _verbose_max_pages = args.max_pages
+    if args.bypass_proxy_test:
+        global _bypass_proxy_test
+        _bypass_proxy_test = True
 
     # Determine mode
     pac_source     = args.pac_file or args.pac_url
@@ -1480,10 +1906,19 @@ Examples:
     # Normalise URL
     if not target.startswith(("http://", "https://")):
         target = "https://" + target
-    hostname = urlparse(target).hostname
+    _parsed  = urlparse(target)
+    hostname = _parsed.hostname
     if not hostname:
         console.print("[bold red]Error:[/bold red] Cannot extract hostname from URL.")
         sys.exit(1)
+    # Reconstruct without fragment — fragments are client-side only and never
+    # sent to the server, but we do want to keep port + path + query.
+    from urllib.parse import urlunparse
+    start_url = urlunparse((
+        _parsed.scheme, _parsed.netloc,
+        _parsed.path, _parsed.params,
+        _parsed.query, ""            # empty fragment
+    ))
 
     session = _make_session(socks_port)
 
@@ -1498,11 +1933,26 @@ Examples:
         f"socks=[cyan]{'127.0.0.1:' + str(socks_port) if socks_port else 'none'}[/cyan]  "
         f"corp-proxy=[cyan]{proxy_label}[/cyan]  "
         f"DIA domains=[cyan]{len(dia_set)}[/cyan]"
+        + (f"  [bold green]verbose[/bold green] max-pages=[cyan]{args.max_pages}[/cyan]" if _verbose else "")
     )
 
+    if _verbose:
+        console.print(Panel(
+            "[bold yellow]Verbose mode is ON[/bold yellow]\n\n"
+            "Same-origin pages will be crawled on every discovered domain "
+            f"(up to [bold]{args.max_pages}[/bold] pages per domain).\n"
+            "This can take significantly longer than a standard scan, especially on large sites.\n\n"
+            "[dim]Tip: use [bold]--max-pages N[/bold] to limit pages per domain, "
+            "or omit [bold]-v[/bold] for a faster run.[/dim]",
+            box=box.ROUNDED,
+            style="yellow",
+        ))
+        console.print()
+
     visited: set[str] = set()
-    with console.status(f"[bold blue]Crawling {hostname}…[/bold blue]", spinner="dots"):
-        root = analyse(
+
+    def _run_analyse():
+        return analyse(
             hostname,
             0,
             args.depth,
@@ -1512,7 +1962,15 @@ Examples:
             dia_set,
             fetch_ns=True,
             proxy_cfg=proxy_cfg,
+            start_url=start_url,
         )
+
+    if _debug:
+        console.print("[dim cyan][DBG] Debug mode enabled — redirect chains and HTTP steps shown[/dim cyan]")
+        root = _run_analyse()
+    else:
+        with console.status(f"[bold blue]Crawling {hostname}…[/bold blue]", spinner="dots"):
+            root = _run_analyse()
 
     print_results(root, target, socks_port, dia_set, pac_result, proxy_cfg, socks_configured=bool(socks_port))
 
